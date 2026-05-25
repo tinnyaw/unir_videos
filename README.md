@@ -16,3 +16,9 @@ El script depende de herramientas estándar del ecosistema multimedia de Linux:
 Para instalarlos en sistemas basados en Debian/Ubuntu:
 ```bash
 sudo apt update && sudo apt install -y ffmpeg jq
+```
+
+## 📖 Modo de uso
+```
+unir_videos_avanzado.sh parte1.mp4 parte2.mp4 parte3.mp4
+```
