@@ -1,0 +1,11 @@
+# Este fichero hay que colocarlo en ~/.local/share/nemo/actions/ para que NEMO lo incluya en su interfaz
+# Además, el script que ponemos en Exec debe estar en una ruta dentro de nuestro PATH (verifica con echo $PATH)
+
+[Nemo Action]
+Name=Unir vídeos (Cronológicamente)
+Comment=Une los vídeos seleccionados sin pérdida de calidad y preservando metadatos
+Exec=unir_videos.py %F
+Icon-Name=video-x-generic
+Selection=M
+Extensions=mp4;mkv;mov;avi;
+Quote=double
