@@ -16,6 +16,7 @@ import subprocess  # Subprocesos seguros para ejecutar ffprobe, ffmpeg y notify-
 import sys         # Argumentos del sistema y códigos de salida
 import tempfile    # Gestión de archivos temporales seguros
 import shutil      # Módulo nativo para verificar la presencia de binarios en el PATH del sistema (zenity, notify-send)
+from datetime import datetime # Conversión y comparación de cadenas ISO 8601 a marcas de tiempo
 
 
 def is_gui_mode():
@@ -139,6 +140,21 @@ def obtener_telemetria(ruta_video: pathlib.Path) -> dict:
     tags_format = datos.get("format", {}).get("tags", {})
     fecha = tags_stream.get("creation_time") or tags_format.get("creation_time")
 
+    dt_obj = None
+    if fecha:
+        # Convierte la cadena textual de fecha extraída de los metadatos de FFmpeg (ISO 8601) a un objeto datetime de Python. 
+        # Si la etiqueta no existe dentro de la cabecera del contenedor del vídeo, utiliza el tiempo de modificación del inodo (ruta_video.stat().st_mtime) como respaldo de seguridad.
+        try:
+            limpio_iso = fecha.replace("Z", "+00:00")
+            dt_obj = datetime.fromisoformat(limpio_iso)
+        except ValueError:
+            dt_obj = None
+
+    if not dt_obj:
+        # Fallback al timestamp de modificación del sistema de archivos (inodo)
+        mtime = ruta_video.stat().st_mtime
+        dt_obj = datetime.fromtimestamp(mtime)
+
     return {
         "archivo": ruta_video.name,
         "ruta": ruta_video,
@@ -149,8 +165,17 @@ def obtener_telemetria(ruta_video: pathlib.Path) -> dict:
         "codec": v_stream.get("codec_name"),
         "rotacion": rotacion,
         "has_audio": has_audio,
-        "fecha_creacion": fecha
+        "fecha_creacion": fecha,
+        "dt_objeto": dt_obj
     }
+
+
+def ordenar_metadatos_por_fecha(metadatos: list[dict]) -> list[dict]:
+    """
+    Ordena la lista de metadatos cronológicamente por su objeto datetime.
+    Aplica Timsort nativo de C en Python ($O(N \log N)$), altamente eficiente para N <= 10.
+    """
+    return sorted(metadatos, key=lambda x: x["dt_objeto"])
 
 
 def calcular_lienzo_dominante(metadatos: list[dict]) -> tuple[int, int]:
@@ -175,12 +200,16 @@ def unificar_videos(archivos: list[str]) -> None:
         sys.exit(1)
 
     rutas = [pathlib.Path(f).resolve() for f in archivos] # Introduzco en la lista rutas, las rutas de los videos con que trabajar
-    metadatos = [obtener_telemetria(r) for r in rutas] # Obtengo los metadatos de todos los vídeos (para determinar el lienzo, formato óptimo de vídeo, en el siguiente paso)
+    metadatos_raw = [obtener_telemetria(r) for r in rutas] # Obtengo los metadatos de todos los vídeos (para determinar el lienzo, formato óptimo de vídeo, en el siguiente paso)
     
-    # 1. Determinar el Lienzo Objetivo Dominante
+    # 1. Ordenación cronológica (Garantiza tomar el vídeo más antiguo como referencia)
+    metadatos = ordenar_metadatos_por_fecha(metadatos_raw)
+    rutas = [m["ruta"] for m in metadatos] # Reconstrucción de rutas ordenadas
+
+    # 2. Determinar el Lienzo Objetivo Dominante
     w_target, h_target = calcular_lienzo_dominante(metadatos)
     
-    # 2. Evaluar si se requiere re-codificación mediante Grafo Complejo
+    # 3. Evaluar si se requiere re-codificación mediante Grafo Complejo
     requiere_transcodificacion = False
     ref_codec = metadatos[0]["codec"]
     
@@ -193,6 +222,8 @@ def unificar_videos(archivos: list[str]) -> None:
             break
 
     dir_padre = rutas[0].parent
+
+    # Obtener la fecha del primer vídeo (metadato interno)
     fecha_str = metadatos[0].get("fecha_creacion") or ""
     fecha_limpia = re.sub(r'[-:]', '', fecha_str).split('.')[0] if fecha_str else "combinado"
     video_salida = dir_padre / f"{fecha_limpia}_unificado{rutas[0].suffix}"
@@ -205,13 +236,20 @@ def unificar_videos(archivos: list[str]) -> None:
             with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as tmp:
                 for r in rutas:
                     tmp.write(f"file '{str(r)}'\n")
-                ruta_tmp = tmp.name
+                ruta_tmp = tmp.name 
+                # ruta_tmp contiene el listado ordenado de ficheros a unir
 
-            # Ejecución del binario externo del sistema: ffmpeg (paquete ffmpeg)
+            # Construcción segura del comando ffmpeg (paquete ffmpeg). Añadimos metadato si existe. 
             cmd_ffmpeg = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", ruta_tmp, "-c", "copy", str(video_salida)
+                "-i", ruta_tmp, "-c", "copy"
             ]
+
+            if fecha_str:
+                cmd_ffmpeg.extend(["-metadata", f"creation_time={fecha_str}"])
+            
+            cmd_ffmpeg.append(str(video_salida)) # En ffmpeg, los metadatos deben especificarse antes de declarar el archivo de salida.
+            
             subprocess.run(cmd_ffmpeg, check=True)
             if os.path.exists(ruta_tmp):
                 os.remove(ruta_tmp)
@@ -252,10 +290,21 @@ def unificar_videos(archivos: list[str]) -> None:
                 "-filter_complex", filter_complex_str,
                 "-map", "[vOut]", "-map", "[aOut]",
                 "-c:v", "libx264", "-preset", "ultrafast",
-                "-c:a", "aac", str(video_salida)
+                "-c:a", "aac"
             ])
 
+            # Inyección de metadatos en recodificación
+            if fecha_str:
+                cmd_ffmpeg.extend(["-metadata", f"creation_time={fecha_str}"])
+
+            cmd_ffmpeg.append(str(video_salida)) # En ffmpeg, los metadatos deben especificarse antes de declarar el archivo de salida.
+
             subprocess.run(cmd_ffmpeg, check=True)
+
+        # 4. CLONACIÓN DE METADATOS DEL SISTEMA DE ARCHIVOS (El equivalente a 'touch')
+        # Copia de forma nativa a nivel del Kernel el bloque de stats del inodo. Esto incluye la fecha de creación/modificación (mtime) y último acceso (atime) del primer vídeo seleccionado
+        if video_salida.exists():
+            shutil.copystat(rutas[0], video_salida)
 
         mostrar_informe_activo("✅ Proceso Completado", f"Guardado como:\n{video_salida.name}")
 
